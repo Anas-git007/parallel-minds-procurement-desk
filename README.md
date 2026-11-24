@@ -1,116 +1,99 @@
 # The Procurement Desk
 
-**Team:** Parallel Minds · **Event:** Data Sprint 2.0, Agentic AI Track
+**Parallel Minds · Data Sprint 2.0 · Agentic AI Track**
 
 ## 1. Overview
 
-The solver reads each row's category, date, supplier, quantity, round, and email thread. It loads the matching playbook and supplier record, identifies the relevant quote, and converts the price to INR per policy unit before tax. It applies the rules in the order below and emits one label per thread.
+For each thread, the solver finds the current supplier quote, looks up the rules in effect on that date, and converts the quote to INR per policy unit before tax. It returns one label in the form `ACTION:REASON:COUNTER_PRICE`. The last field is blank unless the action is `COUNTER`; the trailing colon stays.
 
-| Priority | Condition | Action and reason |
-| --- | --- | --- |
-| 1 | The price is missing or unusable | `ESCALATE:MISSING_INFO` |
-| 2 | The supplier is blacklisted | `REJECT:BLACKLISTED_SUPPLIER` |
-| 3 | The thread matches a prompt injection pattern | `ESCALATE:PROMPT_INJECTION` |
-| 4 | The latest message matches a banned term | `ESCALATE:BANNED_TERM` |
-| 5 | The normalized price is within the concession limit but the order exceeds the approval limit | `ESCALATE:OVER_APPROVAL_LIMIT` |
-| 6 | The normalized price and order value are within their limits | `ACCEPT:ACCEPTABLE_PRICE` |
-| 7 | The normalized price exceeds the concession limit in the final round or later | `REJECT:ABOVE_WALKAWAY` |
-| 8 | The normalized price exceeds the concession limit before the final round | `COUNTER:COUNTER_OFFER` at the rounded concession limit |
+Checks run in this order:
 
-The CSV columns are `thread_id,label`. Each label has the format `ACTION:REASON:COUNTER_PRICE`. The last field is empty except for counters, and the trailing colon is still present.
+1. Escalate if the price is missing or cannot be interpreted.
+2. Reject if the supplier is blacklisted.
+3. Escalate a recognized prompt injection anywhere in the thread.
+4. Escalate a recognized banned term in the latest message.
+5. If the normalized price is within the concession limit, accept unless the order exceeds the approval limit. If the price is above the limit, counter before the final round or reject in the final round and later.
 
 ## 2. Mathematics
 
-Let $x$ be the quoted number, $e$ the INR conversion rate per currency unit, $q$ the requested quantity, and $p$ the normalized unit price. The factors below apply only when their corresponding pattern is present. The implementation uses Python's `Fraction` for exact arithmetic through the price comparison and counter rounding.
+Let `p` be the normalized unit price and `q` the requested quantity. The conversions below apply only when the corresponding wording is present. The solver keeps these calculations as exact fractions.
 
-| Operation | Equation and interpretation |
+| Step | Calculation |
 | --- | --- |
-| Currency and scale | Start with $p = x \times e \times s$. Here $s$ is 1, 1,000 for `k`, or 100,000 for `lakh`. A supplier contract rate overrides the base rate. Number words are converted to a numeric INR amount. |
-| Billing period | $p \leftarrow 12p$ for monthly to annual, or $p \leftarrow p/12$ for annual to monthly. A category that requires a period is escalated when the parser finds none. |
-| Tax | For an inclusive GST quote, $p \leftarrow p/(1+g/100)$, where $g$ is the category GST percentage. |
-| Order total or pack | $p \leftarrow p/n$ for a total covering $n$ units or a recognized count per pack or quote. A dozen divides by 12. |
-| Paper unit | $p \leftarrow 10p$ for a per-ream quote in the printer-paper category, whose policy unit is a box of 10 reams. |
-| Percentage discount | $p \leftarrow p(1-d/100)$ for a list-price discount or a discount of $d$ percent on the supplier's prior quote. A volume discount applies only when $q$ is at least the stated minimum. |
-| Free units | $p \leftarrow p\,a/(a+b)$ when $b$ units are free for every $a$ paid units. |
-| Concession | With target $T$, walk-away price $W$, current round $r$, final round $R$, and category exponent $\beta$, the limit is $L(r)=T+(W-T)((r-1)/(R-1))^{\beta}$. A contract cap replaces $W$ for the applicable category. For a supplier on probation, $L(r)=T$. |
-| Counter | For a nonfinal round with $p>L(r)$, the counter in whole INR is $\lfloor L(r)+1/2\rfloor$. |
-| Approval | Check the order value $p \times q$ only when $p \le L(r)$. Escalate when it is strictly greater than the effective approval limit. Equality is allowed. |
+| Amount and currency | Start with `p = amount × scale × INR exchange rate`. The scale is 1, 1,000 for `k`, or 100,000 for `lakh`. Number words are parsed as INR. A supplier contract rate replaces the default rate. |
+| Billing period | Multiply by 12 for monthly to annual; divide by 12 for annual to monthly. A required period with no recognized month or year makes the price unusable. |
+| GST | For an inclusive quote, divide by `1 + GST rate / 100`. |
+| Quantities and units | Divide a total or pack quote by its stated unit count. A dozen divides by 12. For printer paper quoted per ream, multiply by 10 to get the price per box. |
+| Discounts | Multiply by `1 − discount / 100` for a list-price discount or a discount on a prior supplier quote. Apply a volume discount only if `q` meets the stated minimum. For `b` free units per `a` paid units, multiply by `a / (a + b)`. |
 
-For recognized tiered quotes, use the first amount through the stated upper quantity bound, and the last amount above that bound. For a recognized `between` range, use its last amount. That relies on the supplied format placing the upper end last.
+For target price `T`, walk-away price `W`, current round `r`, final round `R`, and category exponent `β`:
+
+```text
+L(r) = T + (W − T) × ((r − 1) / (R − 1))^β
+```
+
+A supplier contract cap replaces `W`. For suppliers on probation, `L(r) = T`. If `p > L(r)` before the final round, the counter is `floor(L(r) + 0.5)`, in whole INR. If `p ≤ L(r)`, check `p × q` against the approval limit. An order at the exact limit can be accepted.
 
 ## 3. Architecture diagram
 
 ```mermaid
 flowchart LR
-    A["threads.csv"] --> B["Select latest message and quote"]
-    P["Official playbook"] --> C["Load category, dated amendments and supplier record"]
-    B --> D["Normalize offer price"]
+    A["threads.csv"] --> B["Find the latest quote or referenced prior quote"]
+    P["Playbook"] --> C["Resolve dated rules and supplier terms"]
+    B --> D["Normalize the price"]
     C --> D
-    D --> E["Apply ordered checks and calculate label"]
-    B --> E
+    B --> E["Apply the checks in order"]
     C --> E
-    E --> F["Validate IDs and order rows"]
+    D --> E
+    E --> F["Match IDs and order by submission template"]
     S["sample_submission.csv"] --> F
-    F --> G["Submission CSV"]
-    X["Optional worked examples and answers"] --> V["Compare labels and report exact matches"]
-    E --> V
+    F --> G["submission.csv"]
 ```
 
 ## 4. Implementation
 
-The submitted implementation is a single Python file, `solve.py`.
-
-- `load_playbook` reads category values, dated amendments, supplier status and contract overrides, and exchange rates from official Markdown files.
-- `offer_text`, `number_from_words`, and `offer_price` extract the quote and normalize its price. `banned_term` recognizes the contract language listed below.
-- `decide` matches supplier and policy records, chooses which messages to inspect, applies rule precedence, computes the concession limit, and constructs the label.
-- `main` optionally evaluates worked examples, validates the generated ID set against the 2,000 unique template IDs, and writes predictions in the template's order. The answers are used only by the optional evaluation.
+Everything runs through `solve.py`. `load_playbook` reads the Markdown rules. `offer_text` and `offer_price` extract and normalize a quote. `decide` applies the rules and produces the label. `main` validates the thread IDs, writes the CSV in the template's order, and optionally compares predictions with the worked examples. The answer file is used only for that comparison.
 
 ## 5. AI models & APIs
 
-All runtime decisions use deterministic Python code and regular expressions. There are no runtime models, prompts, API calls, API costs, credentials, or free-tier requirements. OpenAI Codex assisted in writing the solver and checking its output during development. Supplier text is never executed or sent to a model by the solver.
+The solver uses Python's standard library and regular expressions. At runtime there is no LLM, prompt, API call, API cost, or free-tier dependency.
 
 ## 6. Tricky cases
 
-| Case | What the code does |
-| --- | --- |
-| Prompt injection | Checks the full thread after the price and blacklist gates. The patterns cover examples such as override claims, instructions to a bot, assistant-looking comments, and a specific Hindi instruction. Matching text triggers an escalation. |
-| Banned terms | Scans the latest message line by line for recognized auto-renewal phrases, unlimited liability, exclusivity, and advance or upfront payments over 30%. The phrase “half the order value” counts as 50%. There are narrow exceptions for explicit renewal negation or mutual agreement wording. |
-| Dated amendments | Applies changes in sorted order when their effective date is on or before the thread date. Initial settings come from the category. |
-| Supplier contracts | Uses the contract cap in place of the category walk-away price when present, and merges contract FX rates over the default rates. |
-| Trading names | Uses the structured supplier column and matches it case-insensitively to the playbook supplier heading. The implementation has no separate alias table or fuzzy trading-name matching. |
-| Currencies | Recognizes INR and its common markers, plus USD, EUR, and GBP with rates from the playbook. A recognized currency with no rate, or an unparseable quote, triggers missing information. |
-| Corrections and earlier quotes | Uses the latest tagged message, or the whole message for a standalone quote. A recognized “should read X, not Y” correction discards the old amount. When an offer references a percentage off a prior quote, the code finds the last earlier block with a matching supplier prefix and applies the discount to that normalized amount. |
-| Multiple prices | Uses the last amount for recognized ranges, selects a tier using quantity, and otherwise uses the first recognized amount on the quote line. Handles supported pack, free-unit, and volume wording as described above. |
+- **Prompt injection:** Scan the full thread for patterns such as override claims, instructions to a bot, assistant-style comments, and a specific Hindi phrase. Treat any match as evidence for escalation.
+- **Banned terms:** Check only the latest message for recognized automatic renewal, unlimited liability, exclusivity, and upfront payments over 30%. The code recognizes “half the order value” and has narrow exceptions for wording that rules out automatic renewal.
+- **Amendments and contracts:** Start with the category values. Apply amendments effective on or before the thread date in sorted order. Use supplier contract caps and exchange rates where present.
+- **Trading names and currencies:** Match the structured supplier name to its playbook heading, ignoring case. There is no alias table. Price parsing recognizes common INR, USD, EUR, and GBP markings. A recognized currency without a rate is escalated.
+- **Corrections and multiple prices:** In a recognized “should read X, not Y” correction, discard the replaced amount. For a discount on a previous quote, use the last earlier block whose sender matches the supplier prefix. For a recognized range, take the last amount, which the supplied format puts at the upper end. For a recognized tier, move from the first to the last quoted amount when the quantity exceeds the threshold.
 
 ## 7. Evaluation
 
-- **Worked examples:** 40 of 40 exact matches with `--check-examples`. There were no mismatches to analyze on that set. The classifier has clearly defined failure modes for unfamiliar phrasing and inputs, described under limitations.
-- **Kaggle public score:** 1.00000 for the first submission, “Playbook solver baseline.” This score applies to the public split. We did not use hidden labels to estimate accuracy.
-- **Submission changes:** This repository packages that baseline. No second submission or post-submission prediction changes were made in this workflow.
-- **Reproduction:** Python 3.10.11 generated 2,000 rows and reproduced the preserved submission byte for byte. Its SHA-256 is `e7cb2ed18e971f21fcc2766a2b9fa02b059daf303a5e1c38005cf1355aaa7d98`.
+The solver matched **40 of 40** official examples, so there were no worked-example errors to break down. The baseline scored **1.00000 on Kaggle's public split**. We kept that submission and made no second submission. Python 3.10.11 regenerated the same 2,000 predictions byte for byte.
+
+The main remaining risks are missed wording variants and ambiguous quotes. The worked examples and public score do not measure those risks on every private row.
 
 ## 8. Real-world application
 
-A procurement team could use this approach to triage well-formed quotes and prepare proposed decisions for approval. In production, use verified supplier IDs, approved and versioned policy and exchange-rate sources, a trusted message parser, role-based access, and an audit record explaining each decision. Route ambiguous terms and flagged input for human review. Require authorized approval before sending a counter, accepting an offer, or creating a purchase order.
+Use the output as a review queue or a suggested counter for a buyer. A production version would need verified supplier IDs, versioned policy and exchange-rate sources, and an audit trail showing the quote and rule behind each decision. A buyer should approve any counter, acceptance, or purchase order before it is sent.
 
 ## 9. Drawbacks & limitations
 
-The quote parser is tuned to the supplied email templates. Unseen languages, reordered price ranges, multiline quotes, attachments, ambiguous contract language, alias-only names, and new units can yield missed or incorrect decisions. An unknown supplier or category can raise an error. Pattern-based security and legal checks can miss paraphrases or flag benign language. The date logic assumes comparable ISO-format dates. The tool writes CSV predictions and is not designed to autonomously negotiate or approve real purchases.
+The parser is tailored to the supplied messages. It can miss unfamiliar wording, attachments, multiline quotes, and supplier aliases. A reversed price range can select the wrong amount. An unknown supplier or category can stop a run. The security and contract checks recognize specific patterns and can miss paraphrases or flag benign text.
 
 ## 10. Original work & disclosures
 
-This entry consists of the team-specific Python parser and ordered decision rules built for the competition with OpenAI Codex assistance. It uses the organizers' playbook, official input CSVs, and worked examples. No third-party runtime libraries, external datasets, or copied solver templates are used. The submitted prediction file was generated by the solver.
+This entry is a custom solver for the competition's playbook and input files. OpenAI Codex generated the Python implementation and drafted the documentation. The implementation uses the official competition data and playbook, with no copied solver template, external dataset, or third-party Python package.
 
 ## 11. How to run
 
-1. Install Python 3.10 or newer. Python 3.10.11 was used for reproduction. `requirements.txt` lists the dependency policy. No packages are required.
-2. Obtain the official files from [the competition Data tab](https://www.kaggle.com/competitions/the-procurement-desk/data). Extract them into a local directory called `data`. It must contain `threads.csv`, `sample_submission.csv`, and `playbook/` (either the direct policy folders or an extra nested `playbook/`). Add `sample_threads.csv` and `sample_answers.csv` to run the worked examples. The official input data is kept separate from the repository.
-3. From the repository root, run the following commands. Use your real dataset path instead of `data` if your inputs are stored elsewhere. Omit `--check-examples` if you only have the prediction inputs.
+Install Python 3.10 or later. Download the official inputs from the [Kaggle Data tab](https://www.kaggle.com/competitions/the-procurement-desk/data) and extract them into `data/`. That directory should contain `threads.csv`, `sample_submission.csv`, and the extracted `playbook/`. Include `sample_threads.csv` and `sample_answers.csv` for the example check.
 
-   ```sh
-   python -m pip install -r requirements.txt
-   python solve.py data reproduced.csv --check-examples
-   python -c "from pathlib import Path; assert Path('submission.csv').read_bytes() == Path('reproduced.csv').read_bytes(); print('Exact CSV match')"
-   ```
+From the repository root:
 
-   Expected result with the original inputs: 40/40 exact example matches, 2,000 output rows, and `Exact CSV match`.
+```sh
+python -m pip install -r requirements.txt
+python solve.py data reproduced.csv --check-examples
+python -c "from pathlib import Path; assert Path('submission.csv').read_bytes() == Path('reproduced.csv').read_bytes(); print('Exact CSV match')"
+```
+
+Use your actual input path in place of `data` if needed. Omit `--check-examples` if you do not have the example files. Expected output with the full data is 40/40 worked-example matches, 2,000 predictions, and `Exact CSV match`.
