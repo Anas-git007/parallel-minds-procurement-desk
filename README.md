@@ -82,7 +82,7 @@ The parser is tailored to the supplied messages. It can miss unfamiliar wording,
 
 ## 10. Original work & disclosures
 
-This entry is a custom solver for the competition's playbook and input files. OpenAI Codex generated the Python implementation and drafted the documentation. The implementation uses the official competition data and playbook, with no copied solver template, external dataset, or third-party Python package.
+We used OpenAI Codex as a coding assistant to implement the playbook in Python and draft this README. We reviewed the order of the decision rules and how the solver handles each case type, including quote corrections, supplier exceptions, and price limits. Our goal was to catch mistakes that would change the final label. The solver matched all 40 official worked examples. It uses the competition's data and playbook, with no external datasets, copied solver templates, or third-party Python packages.
 
 ## 11. How to run
 
